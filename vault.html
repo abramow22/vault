@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vault</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23007acc' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='11' width='18' height='11' rx='2' ry='2'></rect><path d='M7 11V7a5 5 0 0 1 10 0v4'></path></svg>">
+    <!--
+    Vault: single-file, offline, quine‑ish minimal encrypted notepad.
+    - AES-GCM 256 + PBKDF2(SHA-256, 200k), salt+iv per save.
+    - FS Access API when available, else download; file handle stored in IndexedDB.
+    -->
+    <style>
+        /* --- General Setup & Variables --- */
+        :root {
+            --bg-color: #1e1e1e; --ui-bg-color: #252526; --input-bg: #3c3c3c; --border-color: #3c3c3c;
+            --text-color: #cccccc; --text-color-muted: #8c8c8c; --accent-color: #007acc; --accent-hover-color: #0098e6;
+            --danger-color: #f44747; --success-color: #34c759;
+        }
+        html { box-sizing: border-box; }
+        *, *:before, *:after { box-sizing: inherit; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color); color: var(--text-color); margin: 0; overflow: hidden;
+        }
+        h2 { color: var(--text-color); border-bottom: none; padding-bottom: 0; margin: 0 0 1.5em 0; font-size: 1.5em; font-weight: 300; text-align: center; }
+        h3 { margin: 0 0 1em 0; font-weight: 400; }
+
+        /* --- Layout --- */
+        .container {
+            width: 100vw;
+            height: 100dvh;
+            display: flex;
+            flex-direction: column;
+            position: relative;
+        }
+        #main-view {
+            width: 100%; height: 100%; display: flex; flex-direction: column; gap: 1em; padding: 1.5em;
+        }
+        #main-view-header {
+            display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1em; flex-shrink: 0;
+        }
+        #main-view-header h2 {
+            margin: 0; font-size: 1em; font-weight: 400; color: var(--text-color-muted); text-align: left;
+        }
+        .header-actions { display: flex; align-items: center; gap: 0.8em; }
+
+        /* --- Views & Modals --- */
+        dialog {
+            background: transparent; border: none; padding: 0; max-width: 450px; width: 90%;
+            margin: auto; /* Center dialog */
+        }
+        dialog::backdrop {
+            background-color: rgba(0, 0, 0, 0.6);
+        }
+        .modal-overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            display: flex; align-items: center; justify-content: center;
+            background-color: rgba(0, 0, 0, 0.6); z-index: 1000;
+        }
+        .modal-overlay .form-container,
+        dialog .form-container {
+            background-color: var(--ui-bg-color); padding: 2.5em; border-radius: 8px;
+            position: relative; max-width: 450px; width: 90%;
+        }
+        .form-container p { color: var(--text-color-muted); text-align: center; margin: 0 0 1.5em; line-height: 1.4; }
+        
+        /* --- Form Elements & Inputs --- */
+        input[type="password"], textarea {
+            background-color: var(--input-bg); border: 1px solid var(--border-color); color: var(--text-color); border-radius: 4px;
+            padding: 12px; font-size: 1em; width: 100%; margin-bottom: 1em; transition: border-color 0.2s ease, box-shadow 0.2s ease;
+        }
+        input[type="password"]:focus, textarea:focus {
+            outline: none; border-color: var(--accent-color); box-shadow: 0 0 0 1px var(--accent-color);
+        }
+        #notepad-content {
+            flex-grow: 1; min-height: 0; border: none; background-color: var(--bg-color);
+            font-family: 'SF Mono', 'Consolas', 'Menlo', monospace; font-size: 1.1em;
+            resize: none; margin: 0; padding: 1em;
+        }
+        #notepad-content:focus { box-shadow: none; }
+
+        /* --- Buttons --- */
+        button {
+            padding: 12px 20px; border: 1px solid transparent; border-radius: 4px; cursor: pointer;
+            font-size: 1em; font-weight: 600; transition: background-color 0.2s ease, color 0.2s ease;
+        }
+        button:disabled { opacity: 0.5; cursor: not-allowed; pointer-events: none; }
+        button[type="submit"] {
+            width: 100%; background-color: var(--accent-color); color: white;
+        }
+        button[type="submit"]:hover {
+            background-color: var(--accent-hover-color);
+        }
+        button.secondary { background-color: transparent; color: var(--text-color-muted); font-weight: 400; padding: 8px 16px; width: 100%; margin-top: 1em; }
+        button.secondary:hover { color: var(--text-color); background-color: var(--input-bg); }
+        .icon-button {
+            background: none; border: none; padding: 5px; cursor: pointer; color: var(--text-color-muted);
+            transition: color 0.2s ease, opacity 0.2s ease; line-height: 0; position: relative;
+        }
+        .icon-button svg { width: 22px; height: 22px; stroke: currentColor; stroke-width: 1.5; fill: none; }
+        .icon-button:hover:not(:disabled) { color: var(--accent-color); }
+        .icon-button.is-linked { color: var(--success-color); }
+        .icon-button.is-linked:hover { color: #4cd964; }
+        @media (hover: none) and (pointer: coarse) {
+            .icon-button:hover:not(:disabled) { color: var(--text-color-muted); }
+        }
+
+        /* --- States & Modifiers --- */
+        .hidden { display: none !important; }
+        .error { color: var(--danger-color); margin-top: 1em; text-align: center; }
+        #unsaved-indicator { color: var(--accent-color); font-weight: bold; margin-left: 0.25em; }
+
+        /* --- Animations --- */
+        .icon-button.is-success { color: var(--success-color) !important; }
+        .icon-button.is-error { color: var(--danger-color) !important; }
+        
+        @keyframes draw-circle { to { stroke-dashoffset: 0; } }
+        @keyframes draw-symbol { to { stroke-dashoffset: 0; } }
+        @keyframes fade-in-symbol { from { opacity: 0; transform: scale(0.8); } to { opacity: 1; transform: scale(1); } }
+        
+        /* Rules to swap between icon states */
+        .icon-button svg .icon-success,
+        .icon-button svg .icon-error {
+            display: none;
+        }
+        .icon-button.is-success .icon-default,
+        .icon-button.is-error .icon-default {
+            display: none;
+        }
+        .icon-button.is-success .icon-success,
+        .icon-button.is-error .icon-error {
+            display: block;
+        }
+
+        /* Animation triggers and styling for feedback icons */
+        .icon-button.is-success svg .feedback-circle,
+        .icon-button.is-error svg .feedback-circle {
+          stroke-dasharray: 63; stroke-dashoffset: 63;
+          transform-origin: center; transform: rotate(-90deg);
+          animation: draw-circle 0.6s cubic-bezier(0.65, 0, 0.35, 1) forwards;
+        }
+        .icon-button.is-success svg .feedback-symbol {
+          stroke-dasharray: 14; stroke-dashoffset: 14;
+          animation: draw-symbol 0.4s cubic-bezier(0.4, 0, 0.2, 1) forwards 0.3s;
+        }
+        .icon-button.is-error svg .feedback-symbol {
+            opacity: 0; transform-origin: center;
+            animation: fade-in-symbol 0.3s ease-out forwards 0.4s;
+        }
+        .icon-button svg .feedback-circle {
+            stroke-width: 1.5;
+            fill: none;
+        }
+        .icon-button svg .feedback-symbol {
+            stroke-width: 2;
+            fill: none;
+            stroke-linecap: round;
+        }
+
+        /* --- Utilities --- */
+        ::-webkit-scrollbar { width: 10px; height: 10px; }
+        ::-webkit-scrollbar-track { background: var(--bg-color); }
+        ::-webkit-scrollbar-thumb { background-color: var(--input-bg); border-radius: 5px; border: 2px solid var(--bg-color); }
+        ::-webkit-scrollbar-thumb:hover { background-color: var(--text-color-muted); }
+        ::-webkit-scrollbar-corner { background: var(--bg-color); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- MODAL DIALOGS -->
+        <dialog id="password-modal">
+            <form method="dialog" class="form-container" id="password-form">
+                <h2>Set Password</h2>
+                <input type="password" id="password-input" placeholder="Enter password" autocomplete="new-password">
+                <input type="password" id="password-confirm" placeholder="Confirm password" autocomplete="new-password">
+                <button type="submit" value="confirm">Confirm</button>
+                <button type="submit" value="cancel" class="secondary">Cancel</button>
+                <p id="password-error" class="error"></p>
+            </form>
+        </dialog>
+
+        <div id="login-view-container" class="modal-overlay hidden">
+            <div class="form-container">
+                <form id="login-form">
+                    <h2>Unlock Vault</h2>
+                    <p>Enter your master password to decrypt this file.</p>
+                    <input type="password" id="master-password" placeholder="Master Password" required autofocus>
+                    <button type="submit">Unlock</button>
+                    <p id="error-message" class="error"></p>
+                </form>
+            </div>
+        </div>
+        
+        <!-- MAIN CONTENT AREA -->
+        <div id="main-view" class="hidden">
+            <div id="main-view-header">
+                <h2>VAULT<span id="unsaved-indicator" class="hidden">*</span></h2>
+                <div class="header-actions">
+                    <button id="link-file-button" class="icon-button hidden" title="Link to file for direct saving">
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+                            <g class="icon-default">
+                                <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.72"></path>
+                                <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.72-1.72"></path>
+                            </g>
+                            <g class="icon-success">
+                                <circle class="feedback-circle" cx="12" cy="12" r="10" />
+                                <path class="feedback-symbol" d="M8 12.5l3 3 5-5" />
+                            </g>
+                            <g class="icon-error">
+                                <circle class="feedback-circle" cx="12" cy="12" r="10" />
+                                <path class="feedback-symbol" d="M15 9l-6 6M9 9l6 6" />
+                            </g>
+                        </svg>
+                    </button>
+                    <button id="save-icon-button" class="icon-button" title="Download updated file (Ctrl+S)">
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+                            <g class="icon-default">
+                                <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
+                                <polyline points="17 21 17 13 7 13 7 21"></polyline>
+                                <polyline points="7 3 7 8 15 8"></polyline>
+                            </g>
+                            <g class="icon-success">
+                                <circle class="feedback-circle" cx="12" cy="12" r="10" />
+                                <path class="feedback-symbol" d="M8 12.5l3 3 5-5" />
+                            </g>
+                            <g class="icon-error">
+                                <circle class="feedback-circle" cx="12" cy="12" r="10" />
+                                <path class="feedback-symbol" d="M15 9l-6 6M9 9l6 6" />
+                            </g>
+                        </svg>
+                    </button>
+                    <button id="password-icon-button" class="icon-button" title="Change master password">
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"></path></svg>
+                    </button>
+                    <button id="lock-icon-button" class="icon-button" title="Lock vault (Ctrl+R / F5)">
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="10" width="18" height="11" rx="2" ry="2"></rect><path d="M7 10V6a5 5 0 0 1 10 0v4"></path></svg>
+                    </button>
+                </div>
+            </div>
+            
+            <textarea
+                id="notepad-content"
+                placeholder="Your protected text..."
+                spellcheck="false"
+                autocorrect="off"
+                autocapitalize="off"
+                autocomplete="off"
+                autofocus
+            ></textarea>
+        </div>
+    </div>
+
+<script id="vault-data" type="text/encrypted-json"></script>
+
+<script id="app-logic">
+
+// -----------------------------------------------------------------------------
+// 1. Event Bus - Decouples components through pub/sub
+// -----------------------------------------------------------------------------
+const EventBus = (() => {
+    const events = new Map();
+    return {
+        on(event, handler) {
+            if (!events.has(event)) events.set(event, []);
+            events.get(event).push(handler);
+            return () => this.off(event, handler); // Return unsubscribe function
+        },
+        off(event, handler) {
+            const handlers = events.get(event);
+            if (handlers) {
+                const index = handlers.indexOf(handler);
+                if (index > -1) handlers.splice(index, 1);
+            }
+        },
+        emit(event, data) {
+            const handlers = events.get(event);
+            if (handlers) handlers.forEach(h => h(data));
+        }
+    };
+})();
+
+// -----------------------------------------------------------------------------
+// 2. Crypto Service - Handles all encryption/decryption
+// -----------------------------------------------------------------------------
+const CryptoService = (() => {
+    const ITERATIONS = 200_000;
+    
+    const toBase64 = buffer => btoa(String.fromCharCode(...new Uint8Array(buffer)));
+    const fromBase64 = base64 => Uint8Array.from(atob(base64), c => c.charCodeAt(0)).buffer;
+    
+    const deriveKey = async (password, salt) => {
+        const baseKey = await crypto.subtle.importKey(
+            'raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']
+        );
+        return crypto.subtle.deriveKey(
+            { name: 'PBKDF2', salt, iterations: ITERATIONS, hash: 'SHA-256' },
+            baseKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
+        );
+    };
+
+    return {
+        async encrypt(plaintext, password) {
+            const salt = crypto.getRandomValues(new Uint8Array(16));
+            const iv = crypto.getRandomValues(new Uint8Array(12));
+            const key = await deriveKey(password, salt);
+            const encrypted = await crypto.subtle.encrypt(
+                { name: 'AES-GCM', iv }, key, new TextEncoder().encode(plaintext)
+            );
+            return JSON.stringify({
+                salt: toBase64(salt), iv: toBase64(iv), data: toBase64(encrypted)
+            });
+        },
+        
+        async decrypt(encryptedText, password) {
+            try {
+                const { salt, iv, data } = JSON.parse(encryptedText);
+                const key = await deriveKey(password, fromBase64(salt));
+                const decrypted = await crypto.subtle.decrypt(
+                    { name: 'AES-GCM', iv: fromBase64(iv) }, key, fromBase64(data)
+                );
+                return JSON.parse(new TextDecoder().decode(decrypted));
+            } catch (e) {
+                throw new Error('Decryption failed. Check password.');
+            }
+        }
+    };
+})();
+
+// -----------------------------------------------------------------------------
+// 3. Storage Service - Handles IndexedDB operations
+// -----------------------------------------------------------------------------
+const StorageService = (() => {
+    let db = null;
+    
+    const openDB = async () => {
+        if (db) return db;
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open('vault-db', 1);
+            request.onupgradeneeded = () => {
+                const database = request.result;
+                if (!database.objectStoreNames.contains('handles')) {
+                    database.createObjectStore('handles', { keyPath: 'id' });
+                }
+            };
+            request.onsuccess = () => { db = request.result; resolve(db); };
+            request.onerror = () => reject(request.error);
+        });
+    };
+
+    return {
+        async saveHandle(id, handle) {
+            const database = await openDB();
+            const tx = database.transaction('handles', 'readwrite');
+            tx.objectStore('handles').put({ id, handle });
+            return new Promise((resolve, reject) => {
+                tx.oncomplete = resolve;
+                tx.onerror = () => reject(tx.error);
+            });
+        },
+        
+        async getHandle(id) {
+            if (!id) return null;
+            const database = await openDB();
+            const tx = database.transaction('handles', 'readonly');
+            const request = tx.objectStore('handles').get(id);
+            return new Promise((resolve, reject) => {
+                tx.oncomplete = () => resolve(request.result?.handle);
+                tx.onerror = () => reject(tx.error);
+            });
+        }
+    };
+})();
+
+// -----------------------------------------------------------------------------
+// 4. File Service - Handles file operations
+// -----------------------------------------------------------------------------
+const PRISTINE_HTML = document.documentElement.outerHTML;
+
+const FileService = (() => {
+    
+    const getPristineTemplate = () => {
+        return new DOMParser().parseFromString(
+            '<!DOCTYPE html>\n' + PRISTINE_HTML,
+            'text/html'
+        );
+    };
+    
+    return {
+        async generateHTML(payload, password) {
+            const encrypted = await CryptoService.encrypt(JSON.stringify(payload), password);
+            const doc = getPristineTemplate();
+            doc.getElementById('vault-data').textContent = encrypted;
+            return '<!DOCTYPE html>\n' + doc.documentElement.outerHTML;
+        },
+        
+        async downloadFile(content, filename) {
+            const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+
+            if (isIOS && navigator.share && navigator.canShare) {
+                try {
+                    const file = new File([content], filename, { type: 'text/html' });
+                    if (navigator.canShare({ files: [file] })) {
+                        await navigator.share({ files: [file] });
+                        return { success: true }; 
+                    }
+                } catch (err) {
+                    if (err.name === 'AbortError') return { cancelled: true };
+                }
+            }
+
+            if ('showSaveFilePicker' in window) {
+                try {
+                    const handle = await window.showSaveFilePicker({
+                        suggestedName: filename,
+                        types: [{
+                            description: 'HTML Vault',
+                            accept: { 'text/html': ['.html'] },
+                        }],
+                    });
+                    await this.writeToHandle(handle, content);
+                    return { success: true };
+                } catch (err) {
+                    if (err.name === 'AbortError') {
+                        return { cancelled: true };
+                    }
+                    console.error("Save failed via showSaveFilePicker:", err);
+                    return { success: false, error: err };
+                }
+            }
+
+            const blob = new Blob([content], { type: 'text/html;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 100);
+            
+            return { success: true };
+        },
+        
+        async writeToHandle(handle, content) {
+            const writable = await handle.createWritable();
+            await writable.write(content);
+            await writable.close();
+        },
+        
+        async requestFileHandle() {
+            const [handle] = await window.showOpenFilePicker({
+                types: [{ description: 'HTML Vault', accept: { 'text/html': ['.html'] } }]
+            });
+            return handle;
+        },
+        
+        async checkPermission(handle) {
+            if (!handle) return false;
+            if (await handle.queryPermission({ mode: 'readwrite' }) === 'granted') {
+                return true;
+            }
+            const permission = await handle.requestPermission({ mode: 'readwrite' });
+            if (permission === 'prompt') {
+                // This is either Chrome's bug or miss of the ipmlementation. It seems not to wait for the user to make a choice. Specifically when saving after first reload following fresh vault linking to itself. Browser restart fixes this. 
+                throw new Error('Permission prompt is awaiting user action. Please interact with the prompt and save again.');
+            }
+            return permission === 'granted';
+        }
+    };
+})();
+
+// -----------------------------------------------------------------------------
+// 5. State Store - Centralized state management
+// -----------------------------------------------------------------------------
+const Store = (() => {
+    let state = {
+        vaultId: null, content: '', originalContent: '', password: null,
+        fileHandle: null, isDirty: false, isLocked: true
+    };
+    
+    const setState = (updates) => {
+        const oldState = { ...state };
+        state = { ...state, ...updates };
+        EventBus.emit('state:changed', { oldState, newState: state });
+        if (updates.isDirty !== undefined) EventBus.emit('dirty:changed', state.isDirty);
+        if (updates.isLocked !== undefined) EventBus.emit('lock:changed', state.isLocked);
+    };
+    
+    return { get: () => ({ ...state }), set: setState };
+})();
+
+// -----------------------------------------------------------------------------
+// 6. UI Controller - Manages DOM and user interactions
+// -----------------------------------------------------------------------------
+const UI = (() => {
+    const elements = {};
+    
+    const $ = (id) => document.getElementById(id);
+    const show = (el) => el.classList.remove('hidden');
+    const hide = (el) => el.classList.add('hidden');
+    
+    const initElements = () => {
+        elements.loginView = $('login-view-container');
+        elements.loginForm = $('login-form');
+        elements.mainView = $('main-view');
+        elements.passwordModal = $('password-modal');
+        elements.passwordForm = $('password-form'); 
+        elements.notepad = $('notepad-content');
+        elements.unsavedIndicator = $('unsaved-indicator');
+        elements.saveBtn = $('save-icon-button');
+        elements.linkBtn = $('link-file-button');
+        elements.passwordBtn = $('password-icon-button');
+        elements.lockBtn = $('lock-icon-button');
+        elements.masterPasswordInput = $('master-password');
+        elements.errorMsg = $('error-message');
+        elements.passwordInput = $('password-input');
+        elements.passwordConfirm = $('password-confirm');
+        elements.passwordError = $('password-error');
+    };
+    
+    const animations = { success: 2000, error: 3500 };
+    const animState = new WeakMap(); // button -> { timer, className }
+
+    const animateFeedback = (button, success) => {
+        const className = success ? 'is-success' : 'is-error';
+        const other = success ? 'is-error' : 'is-success';
+
+        const prev = animState.get(button);
+        if (prev) {
+            clearTimeout(prev.timer);
+            button.classList.remove(prev.className);
+            animState.delete(button);
+        }
+
+        button.classList.remove(other);
+        button.classList.add(className);
+
+        const timer = setTimeout(() => {
+            button.classList.remove(className);
+            animState.delete(button);
+        }, animations[success ? 'success' : 'error']);
+
+        animState.set(button, { timer, className });
+    };
+    
+    const bindEvents = () => {
+        elements.saveBtn.addEventListener('click', () => EventBus.emit('action:save'));
+        elements.linkBtn.addEventListener('click', () => EventBus.emit('action:link'));
+        elements.lockBtn.addEventListener('click', () => EventBus.emit('action:lock'));
+        elements.notepad.addEventListener('input', (e) => EventBus.emit('content:changed', e.target.value));
+        elements.passwordBtn.addEventListener('click', () => elements.passwordModal.showModal());
+
+        elements.loginForm.addEventListener('submit', (e) => {
+            e.preventDefault(); 
+            EventBus.emit('action:unlock', elements.masterPasswordInput.value);
+        });
+
+        elements.passwordForm.addEventListener('submit', (e) => {
+            if (e.submitter && e.submitter.value === 'cancel') return;
+            e.preventDefault();
+            const password = elements.passwordInput.value;
+            const confirmPassword = elements.passwordConfirm.value;
+            if (!password) {
+                elements.passwordError.textContent = 'Password cannot be empty.';
+            } else if (password !== confirmPassword) {
+                elements.passwordError.textContent = 'Passwords do not match.';
+            } else {
+                elements.passwordModal.close('confirm');
+            }
+        });
+
+        elements.passwordModal.addEventListener('close', () => {
+            if (elements.passwordModal.returnValue === 'confirm') {
+                EventBus.emit('action:setPassword', { password: elements.passwordInput.value });
+            }
+            elements.passwordError.textContent = '';
+            elements.passwordForm.reset();
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if ((e.ctrlKey || e.metaKey) && e.code === 'KeyS') {
+                e.preventDefault();
+                EventBus.emit('action:save');
+            }
+        });
+    };
+    
+    return {
+        init() {
+            initElements();
+            bindEvents();
+            EventBus.on('dirty:changed', (isDirty) => isDirty ? show(elements.unsavedIndicator) : hide(elements.unsavedIndicator));
+        },
+        elements: () => elements,
+        showError: (msg) => elements.errorMsg.textContent = msg,
+        clearError: () => elements.errorMsg.textContent = '',
+        animateFeedback,
+        setContent: (content) => elements.notepad.value = content,
+        showPasswordModal: () => elements.passwordModal.showModal()
+    };
+})();
+
+// -----------------------------------------------------------------------------
+// 7. App Controller - Orchestrates the application
+// -----------------------------------------------------------------------------
+const App = (() => {
+    const init = async () => {
+        UI.init();
+        
+        const encryptedData = document.getElementById('vault-data').textContent.trim();
+        const isPristine = !encryptedData;
+        
+        if ('showOpenFilePicker' in window) UI.elements().linkBtn.classList.remove('hidden');
+
+        if (isPristine) {
+            Store.set({ isLocked: false, content: '', originalContent: '' });
+            UI.elements().mainView.classList.remove('hidden');
+            UI.elements().notepad.focus();
+        } else {
+            Store.set({ isLocked: true });
+            UI.elements().loginView.classList.remove('hidden');
+            UI.elements().masterPasswordInput.focus();
+        }
+        setupActionHandlers();
+    };
+    
+    const setupActionHandlers = () => {
+        let onPasswordSetCallback = () => EventBus.emit('action:save');
+
+        EventBus.on('action:unlock', async (password) => {
+            try {
+                UI.clearError();
+                const encrypted = document.getElementById('vault-data').textContent.trim();
+                const { content, vaultId } = await CryptoService.decrypt(encrypted, password);
+                
+                let fileHandle = null;
+                if (vaultId && 'showOpenFilePicker' in window) {
+                    try { fileHandle = await StorageService.getHandle(vaultId); }
+                    catch (err) { console.error('Failed to retrieve file handle:', err); }
+                }
+                
+                Store.set({ content, originalContent: content, password, vaultId, fileHandle, isLocked: false, isDirty: false });
+                
+                if (fileHandle) UI.elements().linkBtn.classList.add('is-linked');
+                
+                UI.elements().loginView.classList.add('hidden');
+                UI.elements().mainView.classList.remove('hidden');
+                UI.setContent(content);
+                UI.elements().notepad.focus({ preventScroll: true });
+                UI.elements().notepad.setSelectionRange(0, 0);
+
+            } catch (err) {
+                UI.showError('Invalid password');
+                UI.elements().masterPasswordInput.select();
+            }
+        });
+        
+        EventBus.on('action:save', async () => {
+            const state = Store.get();
+            if (state.isLocked) return;
+            if (!state.password) {
+                onPasswordSetCallback = () => EventBus.emit('action:save');
+                UI.showPasswordModal();
+                return;
+            }
+            try {
+                const vaultId = state.vaultId || crypto.randomUUID();
+                const payload = { content: state.content, vaultId };
+                const html = await FileService.generateHTML(payload, state.password);
+
+                let saveSuccessful = false;
+                if (state.fileHandle && await FileService.checkPermission(state.fileHandle)) {
+                    await FileService.writeToHandle(state.fileHandle, html);
+                    saveSuccessful = true;
+                } else {
+                    const result = await FileService.downloadFile(html, `vault-${vaultId.substring(0,8)}.html`);
+                    if (result.cancelled) {
+                        // User cancelled the save dialog, don't update state or show feedback
+                        return;
+                    }
+                    saveSuccessful = result.success;
+                }
+
+                if (saveSuccessful) {
+                    Store.set({ originalContent: state.content, isDirty: false, vaultId });
+                    UI.animateFeedback(UI.elements().saveBtn, true);
+                } else {
+                    UI.animateFeedback(UI.elements().saveBtn, false);
+                }
+            } catch (err) {
+                console.error("Save failed:", err);
+                UI.animateFeedback(UI.elements().saveBtn, false);
+            }
+        });
+
+        EventBus.on('action:setPassword', ({ password }) => {
+            Store.set({ password });
+            if (typeof onPasswordSetCallback === 'function') onPasswordSetCallback();
+            onPasswordSetCallback = () => EventBus.emit('action:save');
+        });
+        
+        EventBus.on('action:link', async () => {
+            const state = Store.get();
+            if (state.isLocked) return;
+
+            if (!state.password) {
+                onPasswordSetCallback = () => EventBus.emit('action:link');
+                UI.showPasswordModal();
+                return;
+            }
+
+            try {
+                const handle = await FileService.requestFileHandle();
+                const currentState = Store.get();
+                const vaultId = currentState.vaultId || crypto.randomUUID();
+                const payload = { content: currentState.content, vaultId };
+                const html = await FileService.generateHTML(payload, currentState.password);
+                
+                await FileService.writeToHandle(handle, html);
+                await StorageService.saveHandle(vaultId, handle);
+                
+                Store.set({ fileHandle: handle, vaultId: vaultId, originalContent: currentState.content, isDirty: false });
+                
+                UI.animateFeedback(UI.elements().linkBtn, true);
+                UI.elements().linkBtn.classList.add('is-linked');
+            } catch (err) {
+                if (err.name !== 'AbortError') { 
+                    console.error('Link and save failed:', err);
+                    UI.animateFeedback(UI.elements().linkBtn, false);
+                    UI.elements().linkBtn.classList.remove('is-linked');
+                }
+            }
+        });
+        
+        EventBus.on('action:lock', () => location.reload());
+        
+        EventBus.on('content:changed', (content) => {
+            const state = Store.get();
+            Store.set({ content, isDirty: content !== state.originalContent });
+        });
+    };
+    
+    return { init };
+})();
+
+// Start the application
+App.init();
+</script>
+</body>
+</html>
